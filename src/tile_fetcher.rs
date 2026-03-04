@@ -1,9 +1,15 @@
 use std::{
     collections::HashMap,
-    fmt, fs,
+    fmt,
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
 };
+
+#[cfg(target_arch = "wasm32")]
+use std::collections::{HashSet, VecDeque};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs;
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -16,12 +22,20 @@ use bevy::{
 use image::{GenericImageView, ImageError};
 use reqwest::{
     StatusCode,
-    blocking::Client,
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use tilemath::Tile as TileMathTile;
 
 use crate::Tile;
+
+#[cfg(target_arch = "wasm32")]
+use base64::Engine as _;
+
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::blocking::Client;
+
+#[cfg(target_arch = "wasm32")]
+use reqwest::Client;
 
 /// Configuration for downloading map tiles.
 #[derive(Resource, Clone, Debug)]
@@ -56,10 +70,16 @@ impl Default for TileFetchConfig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn default_cache_dir() -> PathBuf {
     std::env::var("BEVY_GEO_TILES_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("bevy_geo_tiles_cache"))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn default_cache_dir() -> PathBuf {
+    PathBuf::new()
 }
 
 /// Error type for tile fetching operations.
@@ -89,6 +109,7 @@ impl TileFetchError {
         Self::Network(err.to_string())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn from_io(err: std::io::Error) -> Self {
         Self::Io(err.to_string())
     }
@@ -102,6 +123,7 @@ impl TileFetchError {
 struct PreparedConfig {
     template: String,
     headers: Vec<(HeaderName, HeaderValue)>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     cache_directory: PathBuf,
     cache_extension: String,
 }
@@ -114,6 +136,7 @@ impl PreparedConfig {
             .replace("{y}", &tile.y.to_string())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn cache_path(&self, tile: &TileMathTile) -> PathBuf {
         let mut path = self.cache_directory.clone();
         path.push(tile.zoom.to_string());
@@ -138,6 +161,8 @@ pub struct TileFetcher {
     sender: mpsc::Sender<(TileMathTile, Result<TileImagePayload, TileFetchError>)>,
     receiver: Arc<Mutex<mpsc::Receiver<(TileMathTile, Result<TileImagePayload, TileFetchError>)>>>,
     waiting: HashMap<TileMathTile, Vec<Entity>>,
+    #[cfg(target_arch = "wasm32")]
+    lru: Arc<Mutex<CacheLru>>,
 }
 
 impl FromWorld for TileFetcher {
@@ -175,6 +200,10 @@ impl TileFetcher {
             cache_extension: config.cache_extension,
         };
 
+        #[cfg(target_arch = "wasm32")]
+        let lru = Arc::new(Mutex::new(CacheLru::seed_from_storage()));
+
+        #[cfg(not(target_arch = "wasm32"))]
         if !prepared.cache_directory.exists() {
             fs::create_dir_all(&prepared.cache_directory).map_err(TileFetchError::from_io)?;
         }
@@ -187,6 +216,8 @@ impl TileFetcher {
             sender,
             receiver: Arc::new(Mutex::new(receiver)),
             waiting: HashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            lru,
         })
     }
 
@@ -203,9 +234,14 @@ impl TileFetcher {
         let client = Arc::clone(&self.client);
         let sender = self.sender.clone();
         let config = Arc::clone(&self.config);
+        #[cfg(target_arch = "wasm32")]
+        let lru = Arc::clone(&self.lru);
 
         IoTaskPool::get()
             .spawn(async move {
+                #[cfg(target_arch = "wasm32")]
+                let result = fetch_tile(config, client, tile, lru).await;
+                #[cfg(not(target_arch = "wasm32"))]
                 let result = fetch_tile(config, client, tile);
                 let _ = sender.send((tile, result));
             })
@@ -241,6 +277,7 @@ impl TileFetcher {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_tile(
     config: Arc<PreparedConfig>,
     client: Arc<Client>,
@@ -271,8 +308,8 @@ fn fetch_tile(
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|value: &HeaderValue| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = response
         .bytes()
         .map_err(TileFetchError::from_network)?
@@ -286,6 +323,58 @@ fn fetch_tile(
     Ok(TileImagePayload {
         bytes,
         cached_path: Some(cache_path),
+        content_type,
+        from_cache: false,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_tile(
+    config: Arc<PreparedConfig>,
+    client: Arc<Client>,
+    tile: TileMathTile,
+    lru: Arc<Mutex<CacheLru>>,
+) -> Result<TileImagePayload, TileFetchError> {
+    let cache_key = storage_cache_key(&config, &tile);
+    if let Some(data) = read_local_tile(&cache_key, &lru)? {
+        debug!("loading cached tile from local storage (x={}, y={})", tile.x, tile.y);
+        return Ok(TileImagePayload {
+            bytes: data,
+            cached_path: None,
+            content_type: None,
+            from_cache: true,
+        });
+    }
+
+    debug!("fetching tile (x={}, y={})", tile.x, tile.y);
+    let mut request = client.get(config.format_url(&tile));
+    for (name, value) in &config.headers {
+        request = request.header(name.clone(), value.clone());
+    }
+
+    let response = request.send().await.map_err(TileFetchError::from_network)?;
+    if !response.status().is_success() {
+        return Err(TileFetchError::HttpStatus(response.status()));
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value: &HeaderValue| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(TileFetchError::from_network)?
+        .to_vec();
+
+    if let Err(err) = write_local_tile(&cache_key, &bytes, &lru) {
+        warn!("failed to cache tile in local storage (x={}, y={}): {}", tile.x, tile.y, err);
+    }
+
+    Ok(TileImagePayload {
+        bytes,
+        cached_path: None,
         content_type,
         from_cache: false,
     })
@@ -413,4 +502,143 @@ fn build_image_from_payload(payload: &TileImagePayload) -> Result<Image, TileFet
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn storage_cache_key(config: &PreparedConfig, tile: &TileMathTile) -> String {
+    format!(
+        "bevy_geo_tiles:{}/{}/{}.{}",
+        tile.zoom, tile.x, tile.y, config.cache_extension
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_local_tile(cache_key: &str, lru: &Arc<Mutex<CacheLru>>) -> Result<Option<Vec<u8>>, TileFetchError> {
+    use gloo_storage::{
+        LocalStorage,
+        Storage,
+    };
+
+    match LocalStorage::raw().get_item(cache_key) {
+        Ok(Some(value)) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(value.as_bytes())
+                .map_err(|err| TileFetchError::Io(err.to_string()))?;
+            if let Ok(mut lru) = lru.lock() {
+                lru.touch(cache_key.to_string());
+            }
+            Ok(Some(decoded))
+        }
+        Ok(None) => Ok(None),
+        Err(err) => Err(TileFetchError::Io(format!("{err:?}"))),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn write_local_tile(
+    cache_key: &str,
+    bytes: &[u8],
+    lru: &Arc<Mutex<CacheLru>>,
+) -> Result<(), TileFetchError> {
+    use gloo_storage::{
+        LocalStorage,
+        Storage,
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let storage = LocalStorage::raw();
+    match storage.set_item(cache_key, &encoded) {
+        Ok(()) => {
+            if let Ok(mut lru) = lru.lock() {
+                lru.touch(cache_key.to_string());
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if !is_quota_exceeded(&err) {
+                return Err(TileFetchError::Io(format!("{err:?}")));
+            }
+
+            loop {
+                let oldest = if let Ok(mut lru) = lru.lock() {
+                    lru.pop_oldest()
+                } else {
+                    None
+                };
+
+                match oldest {
+                    Some(oldest_key) => {
+                        let _ = storage.remove_item(&oldest_key);
+                        match storage.set_item(cache_key, &encoded) {
+                            Ok(()) => {
+                                if let Ok(mut lru) = lru.lock() {
+                                    lru.touch(cache_key.to_string());
+                                }
+                                return Ok(());
+                            }
+                            Err(retry_err) => {
+                                if !is_quota_exceeded(&retry_err) {
+                                    return Err(TileFetchError::Io(format!("{retry_err:?}")));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    None => return Err(TileFetchError::Io(format!("{err:?}"))),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_quota_exceeded(err: &impl fmt::Debug) -> bool {
+    let text = format!("{err:?}").to_ascii_lowercase();
+    text.contains("quotaexceeded") || text.contains("quota exceeded")
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+struct CacheLru {
+    order: VecDeque<String>,
+    entries: HashSet<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl CacheLru {
+    fn seed_from_storage() -> Self {
+        use gloo_storage::{
+            LocalStorage,
+            Storage,
+        };
+
+        let storage = LocalStorage::raw();
+        let length = storage.length().unwrap_or(0);
+        let mut order = VecDeque::new();
+        let mut entries = HashSet::new();
+        for index in 0..length {
+            if let Ok(Some(key)) = storage.key(index) {
+                if key.starts_with("bevy_geo_tiles:") {
+                    entries.insert(key.clone());
+                    order.push_back(key);
+                }
+            }
+        }
+        Self { order, entries }
+    }
+
+    fn touch(&mut self, key: String) {
+        if self.entries.contains(&key) {
+            self.order.retain(|item| item != &key);
+        } else {
+            self.entries.insert(key.clone());
+        }
+        self.order.push_back(key);
+    }
+
+    fn pop_oldest(&mut self) -> Option<String> {
+        let key = self.order.pop_front()?;
+        self.entries.remove(&key);
+        Some(key)
+    }
 }
